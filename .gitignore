@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Output files
+output/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Sensitive files
+접속정보.txt
