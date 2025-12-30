@@ -17,3 +17,4 @@ output/
 
 # Sensitive files
 접속정보.txt
+mapper/config.py
