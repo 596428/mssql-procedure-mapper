@@ -1,5 +1,5 @@
 import subprocess
-from typing import Optional
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 from .config import ORACLE_CONFIG, MAPPING_TABLE, COLUMN_MAPPING
 
@@ -15,6 +15,7 @@ class ColumnInfo:
     length: str
     pk: str
     fk: str
+    old_table_eng: str = ""  # 기존 테이블 영문명 (OHIS2015_SCHEMA_COMMENT.N)
     is_mapped: bool = True
 
 
@@ -125,7 +126,8 @@ EXIT;
                 NVL({cm['data_type']}, ' ') || '{d}' ||
                 NVL(TO_CHAR({cm['length']}), ' ') || '{d}' ||
                 NVL2({cm['pk']}, 'Y', ' ') || '{d}' ||
-                NVL2({cm['fk']}, 'Y', ' ')
+                NVL2({cm['fk']}, 'Y', ' ') || '{d}' ||
+                {cm['old_table']}
             FROM {MAPPING_TABLE}
             WHERE UPPER({cm['old_table']}) = UPPER('{old_table_name}')
               AND UPPER({cm['old_column']}) = UPPER('{old_column_name}')
@@ -134,7 +136,7 @@ EXIT;
 
         rows = self._execute_query(query)
 
-        if rows and len(rows[0]) >= 8:
+        if rows and len(rows[0]) >= 9:
             return ColumnInfo(
                 table_kor=rows[0][0].strip(),
                 table_eng=rows[0][1].strip(),
@@ -144,9 +146,173 @@ EXIT;
                 length=rows[0][5].strip(),
                 pk=rows[0][6].strip(),
                 fk=rows[0][7].strip(),
+                old_table_eng=rows[0][8].strip(),
                 is_mapped=True
             )
         return None
+
+    def get_columns_batch(self, column_requests: List[Tuple[str, str]]) -> Dict[Tuple[str, str], ColumnInfo]:
+        """여러 (테이블, 컬럼) 쌍을 한번에 조회 (배치 쿼리)
+
+        Args:
+            column_requests: [(old_table, old_column), ...] 리스트
+
+        Returns:
+            {(upper(old_table), upper(old_column)): ColumnInfo} 딕셔너리
+        """
+        if not column_requests:
+            return {}
+
+        cm = COLUMN_MAPPING
+        d = self.DELIMITER
+
+        # IN 절 생성: (('TABLE1', 'COL1'), ('TABLE2', 'COL2'), ...)
+        in_clause_items = []
+        for old_table, old_column in column_requests:
+            # SQL Injection 방지: 작은따옴표 이스케이프
+            safe_table = old_table.replace("'", "''")
+            safe_column = old_column.replace("'", "''")
+            in_clause_items.append(f"('{safe_table.upper()}', '{safe_column.upper()}')")
+
+        in_clause = ',\n            '.join(in_clause_items)
+
+        query = f"""
+            SELECT
+                {cm['old_table']} || '{d}' ||
+                {cm['old_column']} || '{d}' ||
+                {cm['new_table_kor']} || '{d}' ||
+                {cm['new_table']} || '{d}' ||
+                {cm['new_column_kor']} || '{d}' ||
+                {cm['new_column']} || '{d}' ||
+                NVL({cm['data_type']}, ' ') || '{d}' ||
+                NVL(TO_CHAR({cm['length']}), ' ') || '{d}' ||
+                NVL2({cm['pk']}, 'Y', ' ') || '{d}' ||
+                NVL2({cm['fk']}, 'Y', ' ')
+            FROM {MAPPING_TABLE}
+            WHERE (UPPER({cm['old_table']}), UPPER({cm['old_column']})) IN (
+            {in_clause}
+            );
+        """
+
+        rows = self._execute_query(query)
+
+        result = {}
+        for row in rows:
+            if len(row) >= 10:
+                old_table_key = row[0].strip().upper()
+                old_column_key = row[1].strip().upper()
+                key = (old_table_key, old_column_key)
+
+                result[key] = ColumnInfo(
+                    table_kor=row[2].strip(),
+                    table_eng=row[3].strip(),
+                    col_kor=row[4].strip(),
+                    col_eng=row[5].strip(),
+                    data_type=row[6].strip(),
+                    length=row[7].strip(),
+                    pk=row[8].strip(),
+                    fk=row[9].strip(),
+                    old_table_eng=row[0].strip(),  # 원본 테이블명 (대소문자 원본)
+                    is_mapped=True
+                )
+
+        return result
+
+    def get_tables_batch(self, table_names: List[str]) -> Dict[str, TableInfo]:
+        """여러 테이블을 한번에 조회 (배치 쿼리)
+
+        Args:
+            table_names: [old_table_name, ...] 리스트
+
+        Returns:
+            {upper(old_table_name): TableInfo} 딕셔너리
+        """
+        if not table_names:
+            return {}
+
+        cm = COLUMN_MAPPING
+        d = self.DELIMITER
+
+        # IN 절 생성
+        in_clause_items = []
+        for table_name in table_names:
+            safe_name = table_name.replace("'", "''")
+            in_clause_items.append(f"'{safe_name.upper()}'")
+
+        in_clause = ', '.join(in_clause_items)
+
+        query = f"""
+            SELECT DISTINCT
+                {cm['old_table']} || '{d}' ||
+                {cm['new_table_kor']} || '{d}' ||
+                {cm['new_table']}
+            FROM {MAPPING_TABLE}
+            WHERE UPPER({cm['old_table']}) IN ({in_clause});
+        """
+
+        rows = self._execute_query(query)
+
+        result = {}
+        for row in rows:
+            if len(row) >= 3:
+                old_table_key = row[0].strip().upper()
+
+                result[old_table_key] = TableInfo(
+                    table_kor=row[1].strip() or '',
+                    table_eng=row[2].strip() or '',
+                    is_mapped=True
+                )
+
+        return result
+
+    def get_all_columns_for_table(self, old_table_name: str) -> List[ColumnInfo]:
+        """특정 테이블의 모든 컬럼 정보 조회 (SELECT * 처리용)
+
+        Args:
+            old_table_name: 기존 테이블명
+
+        Returns:
+            해당 테이블의 모든 ColumnInfo 리스트
+        """
+        cm = COLUMN_MAPPING
+        d = self.DELIMITER
+        safe_name = old_table_name.replace("'", "''")
+
+        query = f"""
+            SELECT
+                {cm['old_column']} || '{d}' ||
+                {cm['new_table_kor']} || '{d}' ||
+                {cm['new_table']} || '{d}' ||
+                {cm['new_column_kor']} || '{d}' ||
+                {cm['new_column']} || '{d}' ||
+                NVL({cm['data_type']}, ' ') || '{d}' ||
+                NVL(TO_CHAR({cm['length']}), ' ') || '{d}' ||
+                NVL2({cm['pk']}, 'Y', ' ') || '{d}' ||
+                NVL2({cm['fk']}, 'Y', ' ')
+            FROM {MAPPING_TABLE}
+            WHERE UPPER({cm['old_table']}) = UPPER('{safe_name}')
+            ORDER BY {cm['new_column']};
+        """
+
+        rows = self._execute_query(query)
+        result = []
+
+        for row in rows:
+            if len(row) >= 9:
+                result.append(ColumnInfo(
+                    table_kor=row[1].strip(),
+                    table_eng=row[2].strip(),
+                    col_kor=row[3].strip(),
+                    col_eng=row[4].strip(),
+                    data_type=row[5].strip(),
+                    length=row[6].strip(),
+                    pk=row[7].strip(),
+                    fk=row[8].strip(),
+                    old_table_eng=old_table_name,
+                    is_mapped=True
+                ))
+
+        return result
 
     def create_unmapped_table_info(self, old_table_name: str) -> TableInfo:
         """매핑되지 않은 테이블 정보 생성"""
@@ -167,6 +333,7 @@ EXIT;
             length='',
             pk='',
             fk='',
+            old_table_eng=old_table_name,
             is_mapped=False
         )
 
@@ -189,6 +356,7 @@ EXIT;
             length='',
             pk='',
             fk='',
+            old_table_eng=f"[인라인뷰] {alias}",
             is_mapped=False
         )
 

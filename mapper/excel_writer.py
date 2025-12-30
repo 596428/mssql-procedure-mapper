@@ -116,7 +116,7 @@ class ExcelWriter:
         cell.font = self.section_font_white
         cell.fill = self.section_fill
         # 병합
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=9)
         return row + 1
 
     def _write_table_info(self, ws, row: int, table_infos: List[TableInfo]) -> int:
@@ -156,7 +156,7 @@ class ExcelWriter:
     def _write_column_info(self, ws, row: int, column_infos: List[ColumnInfo]) -> int:
         """항목 정보 작성"""
         # 헤더
-        headers = ["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK"]
+        headers = ["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK", "기존 테이블 영문명"]
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=row, column=col, value=header)
             cell.font = self.header_font
@@ -174,7 +174,8 @@ class ExcelWriter:
                 info.data_type,
                 info.length,
                 info.pk,
-                info.fk
+                info.fk,
+                info.old_table_eng
             ]
             for col, value in enumerate(values, 1):
                 cell = ws.cell(row=row, column=col, value=value)
@@ -239,7 +240,7 @@ class ExcelWriter:
 
             # 항목 정보 섹션
             writer.writerow([f"[{sheet_type} 항목 정보]"])
-            writer.writerow(["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK", "매핑여부"])
+            writer.writerow(["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK", "기존 테이블 영문명", "매핑여부"])
 
             for info in column_infos:
                 writer.writerow([
@@ -251,6 +252,7 @@ class ExcelWriter:
                     info.length,
                     info.pk,
                     info.fk,
+                    info.old_table_eng,
                     "O" if info.is_mapped else "X"
                 ])
 

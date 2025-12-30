@@ -4,6 +4,7 @@ import google.generativeai as genai
 from typing import Optional
 from dataclasses import dataclass, field
 from .config import GEMINI_API_KEY, GEMINI_API_KEYS
+from .sql_parser import SQLParser
 
 
 @dataclass
@@ -36,69 +37,104 @@ class AnalysisResult:
     response_time: float = 0.0  # 응답 시간 (초)
 
 
-ANALYSIS_PROMPT = """
+# ============================================================
+# Phase 1: 프로시저 분석 프롬프트 (자연어 분석에 집중)
+# ============================================================
+PHASE1_ANALYSIS_PROMPT = """
 당신은 MSSQL 프로시저/쿼리 분석 전문가입니다.
-주어진 SQL 코드를 분석하여 입력값과 출력값을 구분해주세요.
+SQL 파서가 추출한 기본 정보를 참고하여, SQL 코드를 정밀 분석해주세요.
 
-## 분석 규칙:
+## SQL 파서 전처리 결과 (참고용):
+{parser_hint}
 
-### 프로시저 설명 (description)
+## 분석 순서 (이 순서대로 작성):
+
+### 1. 프로시저 설명 (description)
 - 이 프로시저가 무엇을 하는지 설명
 - 다음 내용을 포함: 어떤 테이블에서, 어떤 조건으로, 어떤 데이터를 조회/처리하는지
 - **IF/ELSE 분기가 있는 경우**: 각 분기 조건과 해당 분기에서 수행하는 작업을 설명
   - 예: "IF @SaupID < 0일 경우 전체 목록 조회, 그렇지 않으면 특정 사업장만 조회"
 - 한국어로 3-5문장 정도로 작성
 
-### 입력값 (input_columns)
-- 메인 쿼리와 서브쿼리의 WHERE 절에서 프로시저 파라미터(@xxx)와 비교되는 컬럼들
-- 예: `WHERE SDate <= @VisitDate` → SDate는 @VisitDate의 입력 컬럼
-- 예: `WHERE A.Code = @Code` → Code는 @Code의 입력 컬럼
+### 2. 파라미터 목록
+- 프로시저 선언부의 모든 @파라미터를 나열
+- 각 파라미터의 타입과 기본값(있으면)
 
-### 출력값 (output_columns)
-- SELECT 절에 나오는 모든 컬럼들
-- **중요**: 서브쿼리 결과(AS alias)는 서브쿼리 내부의 원본 테이블과 컬럼을 추적해서 기록
-  - 예: `(SELECT ',' + K.Keyword FROM CODE_JidoKeyword K ...) AS Keyword`
-    → table: "CODE_JidoKeyword", column: "Keyword"
-  - 예: `(SELECT ',' + K1.Name FROM TableA K2 INNER JOIN TableB K1 ...) AS Pyeongga`
-    → table: "TableB", column: "Name" (SELECT에서 실제 사용된 컬럼의 테이블)
+### 3. 사용 테이블 목록 (파서 결과 보완/수정)
+- FROM, JOIN에 사용된 모든 테이블 나열
+- 각 테이블의 별칭(alias) 명시
+- 임시테이블(#으로 시작)은 [임시]로 표시
+- 파서가 놓친 테이블이 있으면 추가
 
-### 테이블
-- FROM, JOIN 절의 모든 테이블 (메인쿼리 + 서브쿼리 전부)
-- 별칭(alias)이 있으면 함께 기록
-- **Derived Table (인라인 뷰) 구분**:
-  - `(SELECT ... UNION ...) AS A` 형태의 서브쿼리로 생성된 가상 테이블은 `is_derived: true`로 표시
-  - 실제 물리적 테이블은 `is_derived: false` 또는 생략
+### 4. IF/ELSE 분기 분석
+- 각 분기의 조건과 해당 분기에서 실행되는 SELECT문 설명
+- 분기가 없으면 "분기 없음" 명시
 
-## 출력 형식 (JSON):
-```json
-{
-  "description": "프로시저 설명 (어떤 테이블에서, 어떤 조건으로, 어떤 데이터를 가져오는지, IF/ELSE 분기 조건 포함)",
-  "parameters": [
-    {"name": "@ParamName", "type": "CHAR(10)"}
-  ],
-  "input_columns": [
-    {"table": "테이블명", "column": "컬럼명", "parameter": "@연관파라미터"}
-  ],
-  "output_columns": [
-    {"table": "테이블명", "column": "컬럼명", "is_derived": false}
-  ],
-  "tables": [
-    {"name": "테이블명", "alias": "별칭", "is_derived": false},
-    {"name": "DerivedTable", "alias": "A", "is_derived": true}
-  ]
-}
-```
+### 5. 입력 컬럼 (WHERE 조건)
+- WHERE 절에서 @파라미터와 비교되는 컬럼들
+- 형식: "테이블명.컬럼명 ← @파라미터명"
 
-## 중요:
-- 반드시 유효한 JSON만 출력하세요
-- 마크다운 코드블록 없이 순수 JSON만 출력하세요
-- 테이블명에서 스키마(dbo.)는 제거하세요
-- output_columns의 table은 반드시 원본 테이블명을 사용 (별칭 A, B가 아닌 실제 테이블명)
-- 서브쿼리의 SELECT 컬럼도 원본 테이블까지 추적하여 기록
-- 계산식(CASE, ISNULL 등)은 관련 컬럼들을 각각 별도로 기록
-- Derived Table(인라인 뷰)의 컬럼은 output_columns에서 is_derived: true로 표시
+### 6. 출력 컬럼 (SELECT 절) ★가장 중요★
+- 모든 SELECT문의 출력 컬럼을 빠짐없이 나열
+- IF/ELSE 분기가 있으면 각 분기별로 구분하여 나열
+- 형식: "테이블명.컬럼명" (별칭 A, B 대신 원본 테이블명 사용)
+- SELECT * 또는 A.* 형태는 "테이블명.*"로 기록
+- CASE, ISNULL 등에 포함된 컬럼도 각각 기록
+
+#### ★ 서브쿼리/임시테이블 컬럼 규칙 (필수):
+
+**1) 서브쿼리 → 원본 테이블 추적**:
+- 서브쿼리 결과(별칭)가 아닌, **원본 테이블의 실제 컬럼명**까지 추적
+- 예시:
+  ```sql
+  SELECT CntDr FROM (SELECT DamdangDr, COUNT(*) AS CntDr FROM NBOGUN_Saupja GROUP BY DamdangDr) Dr
+  ```
+  → 잘못: "CntDr" (서브쿼리 별칭)
+  → 올바름: "NBOGUN_Saupja.DamdangDr" (원본 테이블.컬럼)
+- 집계함수(COUNT, SUM 등)의 결과는 GROUP BY 컬럼을 기록
+
+**2) 임시테이블(#으로 시작) → 그대로 유지**:
+- SELECT INTO로 생성된 임시테이블 컬럼은 **임시테이블명.컬럼명** 그대로 기록
+- 예시: `#staff_temp.VisitCnt` → 그대로 "#staff_temp.VisitCnt"
+- 임시테이블은 [임시] 또는 is_derived: true로 표시
+
+## 주의사항:
+- dbo. 등 스키마 접두사는 제거
+- 테이블 별칭(A, B 등) 대신 원본 테이블명 사용
+- 서브쿼리 별칭(CntDr, VisitCnt 등)이 아닌 원본 컬럼명(DamdangDr, Visitor 등) 사용
+- 파서 결과를 기반으로 하되, SQL을 직접 분석하여 누락된 항목 보완
 
 ## 분석할 SQL:
+"""
+
+# ============================================================
+# Phase 2: JSON 변환 프롬프트
+# ============================================================
+PHASE2_JSON_PROMPT = """
+아래의 프로시저 분석 결과를 JSON 형식으로 변환해주세요.
+
+## 입력된 분석 결과:
+{analysis_text}
+
+## 변환 규칙:
+1. description: 프로시저 설명을 그대로 전달 (요약하지 말 것)
+2. parameters: 파라미터 목록을 배열로 변환
+3. input_columns: 입력 컬럼을 배열로 변환 (테이블, 컬럼, 파라미터)
+4. output_columns: 출력 컬럼을 배열로 변환 (테이블, 컬럼)
+   - 임시테이블/인라인뷰는 is_derived: true
+   - 일반 테이블은 is_derived: false
+5. tables: 사용 테이블을 배열로 변환
+   - 임시테이블/인라인뷰는 is_derived: true
+6. 중복된 (테이블, 컬럼) 쌍은 제거
+
+## 출력 형식 (순수 JSON만, 마크다운 없이):
+{{
+  "description": "프로시저 설명",
+  "parameters": [{{"name": "@Param", "type": "CHAR(10)"}}],
+  "input_columns": [{{"table": "테이블명", "column": "컬럼명", "parameter": "@파라미터"}}],
+  "output_columns": [{{"table": "테이블명", "column": "컬럼명", "is_derived": false}}],
+  "tables": [{{"name": "테이블명", "alias": "A", "is_derived": false}}]
+}}
 """
 
 
@@ -114,7 +150,7 @@ class GeminiAnalyzer:
             raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다.")
 
         genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash')
+        self.model = genai.GenerativeModel('gemini-3-pro-preview')
 
     def _switch_api_key(self):
         """API 키 전환 (429 에러 대응)"""
@@ -126,23 +162,59 @@ class GeminiAnalyzer:
         return False
 
     def analyze(self, procedure_text: str) -> AnalysisResult:
-        """프로시저 텍스트 분석"""
-        prompt = ANALYSIS_PROMPT + procedure_text
-
+        """프로시저 텍스트 분석 (3-phase 방식: 파서 → 분석 → JSON)"""
         try:
             start_time = time.time()
-            # 타임아웃 설정 (60초)
-            response = self.model.generate_content(
-                prompt,
-                request_options={"timeout": 60}
+
+            # ========================================
+            # Phase 0: SQL 파서 전처리
+            # ========================================
+            print("  [Phase 0] SQL 파서 전처리 중...")
+            parser = SQLParser()
+            parse_result = parser.parse(procedure_text)
+            parser_hint = parser.to_structured_text(parse_result)
+            print(f"  [Phase 0] 완료 (테이블 {len(parse_result.all_tables)}개, 컬럼 {len(parse_result.all_select_columns)}개 추출)")
+
+            # ========================================
+            # Phase 1: 프로시저 분석 (자연어 출력)
+            # ========================================
+            phase1_prompt = PHASE1_ANALYSIS_PROMPT.format(parser_hint=parser_hint) + procedure_text
+
+            print("  [Phase 1] 프로시저 분석 중...")
+            phase1_response = self.model.generate_content(
+                phase1_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.7,
+                ),
+                request_options={"timeout": 120}
             )
+            analysis_text = phase1_response.text.strip()
+            phase1_time = time.time() - start_time
+            print(f"  [Phase 1] 완료 ({phase1_time:.2f}초)")
+
+            # ========================================
+            # Phase 2: JSON 변환
+            # ========================================
+            phase2_prompt = PHASE2_JSON_PROMPT.format(analysis_text=analysis_text)
+
+            print("  [Phase 2] JSON 변환 중...")
+            phase2_start = time.time()
+            phase2_response = self.model.generate_content(
+                phase2_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,  # JSON 변환은 약간 낮은 temperature
+                ),
+                request_options={"timeout": 120}
+            )
+            json_text = phase2_response.text.strip()
+            phase2_time = time.time() - phase2_start
+            print(f"  [Phase 2] 완료 ({phase2_time:.2f}초)")
+
             elapsed_time = time.time() - start_time
 
-            raw_text = response.text.strip()
-
             # JSON 파싱
-            result = self._parse_response(raw_text)
-            result.raw_response = raw_text
+            result = self._parse_response(json_text)
+            result.raw_response = f"=== Phase 1 분석 결과 ===\n{analysis_text}\n\n=== Phase 2 JSON 변환 ===\n{json_text}"
             result.response_time = elapsed_time
             return result
 

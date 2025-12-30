@@ -6,6 +6,7 @@ C# → Java 마이그레이션용 테이블/컬럼 명칭 변환
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -36,7 +37,7 @@ def process_mapping(
     analysis: AnalysisResult,
     mapper: OracleMapper
 ) -> Tuple[List[TableInfo], List[ColumnInfo], List[TableInfo], List[ColumnInfo]]:
-    """분석 결과를 매핑 정보로 변환"""
+    """분석 결과를 매핑 정보로 변환 (배치 쿼리 최적화)"""
 
     input_tables = []
     input_columns = []
@@ -56,26 +57,79 @@ def process_mapping(
             if t.alias:
                 derived_tables.add(t.alias)
 
-    # 입력 컬럼 처리 (WHERE 조건에서 파라미터와 비교되는 컬럼들)
-    input_table_set = set()
-    input_derived_set = set()  # Derived Table 별칭 추적
+    # ========================================
+    # 1단계: 필요한 모든 (테이블, 컬럼) 쌍 수집
+    # ========================================
+    column_requests = []  # [(table, column), ...]
+    table_requests = set()  # {table_name, ...}
+
+    input_derived_set = set()
+    output_derived_set = set()
+
+    # 입력 컬럼 요청 수집
+    input_column_keys = []  # [(original_table, col, is_derived, alias_if_derived), ...]
     for in_col in analysis.input_columns:
         tbl = in_col.table
         col = in_col.column
-
-        # 별칭으로 원본 테이블 찾기
         original_table = alias_to_table.get(tbl, tbl)
-
-        # Derived Table 여부 확인
         is_derived = in_col.is_derived or tbl in derived_tables or original_table in derived_tables
 
         if is_derived:
-            # Derived Table (인라인 뷰)는 별도 처리
             alias = tbl if tbl in derived_tables else original_table
-            col_info = mapper.create_derived_column_info(alias, col)
+            input_column_keys.append((original_table, col, True, alias))
             input_derived_set.add(alias)
         else:
-            col_info = mapper.get_column_info(original_table, col)
+            input_column_keys.append((original_table, col, False, None))
+            column_requests.append((original_table, col))
+            table_requests.add(original_table)
+
+    # 출력 컬럼 요청 수집
+    output_column_keys = []
+    star_column_tables = []  # SELECT * 처리용: [(original_table, is_derived, alias), ...]
+
+    for out_col in analysis.output_columns:
+        tbl = out_col.table
+        col = out_col.column
+        original_table = alias_to_table.get(tbl, tbl)
+        is_derived = out_col.is_derived or tbl in derived_tables or original_table in derived_tables
+
+        if is_derived:
+            alias = tbl if tbl in derived_tables else original_table
+            output_column_keys.append((original_table, col, True, alias))
+            output_derived_set.add(alias)
+        elif col == '*':
+            # SELECT * 컬럼은 별도 처리 (해당 테이블의 모든 컬럼 조회 필요)
+            star_column_tables.append((original_table, False, None))
+            table_requests.add(original_table)
+        else:
+            output_column_keys.append((original_table, col, False, None))
+            column_requests.append((original_table, col))
+            table_requests.add(original_table)
+
+    # ========================================
+    # 2단계: 배치 쿼리 실행 (1-2회 SQLcl 호출)
+    # ========================================
+    # 중복 제거
+    unique_column_requests = list(set(column_requests))
+    unique_table_requests = list(table_requests)
+
+    # 배치 조회
+    column_cache = mapper.get_columns_batch(unique_column_requests)
+    table_cache = mapper.get_tables_batch(unique_table_requests)
+
+    # ========================================
+    # 3단계: 캐시에서 결과 조회하여 ColumnInfo 생성
+    # ========================================
+
+    # 입력 컬럼 처리
+    input_table_set = set()
+    for original_table, col, is_derived, alias in input_column_keys:
+        if is_derived:
+            col_info = mapper.create_derived_column_info(alias, col)
+        else:
+            # 캐시에서 조회 (키는 대문자)
+            key = (original_table.upper(), col.upper())
+            col_info = column_cache.get(key)
             if not col_info:
                 col_info = mapper.create_unmapped_column_info(original_table, col)
             input_table_set.add(original_table)
@@ -90,7 +144,8 @@ def process_mapping(
 
     # 입력 테이블 정보 추가
     for table_name in input_table_set:
-        table_info = mapper.get_table_info(table_name)
+        key = table_name.upper()
+        table_info = table_cache.get(key)
         if not table_info:
             table_info = mapper.create_unmapped_table_info(table_name)
         input_tables.append(table_info)
@@ -99,26 +154,41 @@ def process_mapping(
     for alias in input_derived_set:
         input_tables.append(mapper.create_derived_table_info(alias))
 
-    # 출력 컬럼 처리 (SELECT 절의 컬럼들)
+    # 출력 컬럼 처리
     output_table_set = set()
-    output_derived_set = set()  # Derived Table 별칭 추적
-    for out_col in analysis.output_columns:
-        tbl = out_col.table
-        col = out_col.column
 
-        # 별칭으로 원본 테이블 찾기
-        original_table = alias_to_table.get(tbl, tbl)
-
-        # Derived Table 여부 확인
-        is_derived = out_col.is_derived or tbl in derived_tables or original_table in derived_tables
-
+    # SELECT * 컬럼 확장 처리
+    for original_table, is_derived, alias in star_column_tables:
         if is_derived:
-            # Derived Table (인라인 뷰)는 별도 처리
-            alias = tbl if tbl in derived_tables else original_table
-            col_info = mapper.create_derived_column_info(alias, col)
-            output_derived_set.add(alias)
+            # Derived 테이블의 *는 그대로 처리
+            col_info = mapper.create_derived_column_info(alias, '*')
+            output_columns.append(col_info)
         else:
-            col_info = mapper.get_column_info(original_table, col)
+            # 일반 테이블: 해당 테이블의 모든 컬럼 조회
+            all_cols = mapper.get_all_columns_for_table(original_table)
+            if all_cols:
+                for col_info in all_cols:
+                    # 중복 체크 후 추가
+                    exists = any(
+                        c.table_eng == col_info.table_eng and c.col_eng == col_info.col_eng
+                        for c in output_columns
+                    )
+                    if not exists:
+                        output_columns.append(col_info)
+                output_table_set.add(original_table)
+            else:
+                # 매핑 테이블에 없으면 [매핑없음] *로 추가
+                col_info = mapper.create_unmapped_column_info(original_table, '*')
+                output_columns.append(col_info)
+                output_table_set.add(original_table)
+
+    # 개별 컬럼 처리
+    for original_table, col, is_derived, alias in output_column_keys:
+        if is_derived:
+            col_info = mapper.create_derived_column_info(alias, col)
+        else:
+            key = (original_table.upper(), col.upper())
+            col_info = column_cache.get(key)
             if not col_info:
                 col_info = mapper.create_unmapped_column_info(original_table, col)
             output_table_set.add(original_table)
@@ -133,7 +203,8 @@ def process_mapping(
 
     # 출력 테이블 정보 추가
     for table_name in output_table_set:
-        table_info = mapper.get_table_info(table_name)
+        key = table_name.upper()
+        table_info = table_cache.get(key)
         if not table_info:
             table_info = mapper.create_unmapped_table_info(table_name)
         output_tables.append(table_info)
@@ -147,14 +218,19 @@ def process_mapping(
 
 def run(input_file: str, output_file: str):
     """메인 실행"""
+    total_start = time.time()
+    step_times = {}
+
     print(f"=== 프로시저 매핑 도구 ===")
     print(f"입력: {input_file}")
     print()
 
     # 1. 프로시저 파일 읽기
+    step_start = time.time()
     print("[1/5] 프로시저 파일 읽기...")
     procedure_text = read_procedure_file(input_file)
     print(f"  - 읽은 텍스트 길이: {len(procedure_text)} 자")
+    step_times['1_파일읽기'] = time.time() - step_start
 
     # 프로시저 이름 추출
     proc_name = extract_procedure_name(procedure_text)
@@ -179,9 +255,11 @@ def run(input_file: str, output_file: str):
     print(f"출력 경로: {excel_dir}")
 
     # 2. Gemini API로 분석
+    step_start = time.time()
     print("[2/5] Gemini API로 프로시저 분석 중...")
     analyzer = GeminiAnalyzer()
     analysis = analyzer.analyze(procedure_text)
+    step_times['2_Gemini분석'] = time.time() - step_start
     print(f"  - 응답 시간: {analysis.response_time:.2f}초")
     print(f"  - 발견된 테이블: {len(analysis.tables)}개")
     print(f"  - 발견된 파라미터: {[p.get('name', p) if isinstance(p, dict) else p for p in analysis.parameters]}")
@@ -198,11 +276,13 @@ def run(input_file: str, output_file: str):
         print("  (설명 없음)")
 
     # 4. Oracle DB에서 매핑 조회
+    step_start = time.time()
     print("[4/5] Oracle DB에서 매핑 정보 조회 중...")
     with OracleMapper() as mapper:
         input_tables, input_columns, output_tables, output_columns = process_mapping(
             analysis, mapper
         )
+    step_times['4_DB매핑조회'] = time.time() - step_start
 
     # 매핑 통계
     unmapped_tables = set()
@@ -223,6 +303,7 @@ def run(input_file: str, output_file: str):
             print(f"    ! {t}")
 
     # 5. Excel/CSV 출력
+    step_start = time.time()
     print("[5/5] Excel/CSV 파일 생성 중...")
     writer = ExcelWriter()
     writer.create_description_sheet(proc_name, analysis.description, analysis.parameters)
@@ -233,11 +314,21 @@ def run(input_file: str, output_file: str):
     # CSV 출력
     writer.save_csv(str(csv_input_file), input_tables, input_columns, "입력")
     writer.save_csv(str(csv_output_file), output_tables, output_columns, "출력")
+    step_times['5_파일저장'] = time.time() - step_start
+
+    # 총 실행 시간 계산
+    total_time = time.time() - total_start
 
     print()
     print("=== 완료 ===")
     print(f"Excel: {excel_file}")
     print(f"CSV: {csv_input_file.name}, {csv_output_file.name}")
+    print()
+    print("=== 실행 시간 ===")
+    for step, elapsed in step_times.items():
+        print(f"  {step}: {elapsed:.2f}초")
+    print(f"  ----------------")
+    print(f"  총 실행 시간: {total_time:.2f}초")
 
 
 def main():
