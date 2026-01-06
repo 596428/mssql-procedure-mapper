@@ -19,3 +19,10 @@ output/
 접속정보.txt
 mapper/config.py
 input.txt
+
+# Project specific
+BOGUN2018/
+BOGUN2018*.zip
+BOGUN2018*.zip:Zone.Identifier
+BOGUN2018_*.md
+problem_case/

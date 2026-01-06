@@ -13,6 +13,7 @@ from typing import List, Tuple, Optional
 from .gemini_analyzer import GeminiAnalyzer, AnalysisResult
 from .oracle_mapper import OracleMapper, TableInfo, ColumnInfo
 from .excel_writer import ExcelWriter
+from .mssql_reader import get_procedure_from_db
 
 
 def extract_procedure_name(sql_text: str) -> Optional[str]:
@@ -31,6 +32,17 @@ def read_procedure_file(filepath: str) -> str:
 
     with open(path, 'r', encoding='utf-8') as f:
         return f.read()
+
+
+def remove_sql_comments(sql: str) -> str:
+    """MSSQL 주석 제거 전처리"""
+    # 블록 주석 /* ... */ 제거 (멀티라인 포함)
+    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+    # 단일행 주석 -- ... 제거
+    sql = re.sub(r'--[^\n]*', '', sql)
+    # 연속된 빈 줄 정리
+    sql = re.sub(r'\n\s*\n', '\n', sql)
+    return sql.strip()
 
 
 def process_mapping(
@@ -216,29 +228,50 @@ def process_mapping(
     return input_tables, input_columns, output_tables, output_columns
 
 
-def run(input_file: str, output_file: str):
-    """메인 실행"""
+def run(input_file: str, output_file: str, proc_name_arg: Optional[str] = None):
+    """메인 실행
+
+    Args:
+        input_file: 입력 파일 경로 (기본 방식)
+        output_file: 출력 파일 경로
+        proc_name_arg: 프로시저 이름 (DB 조회 방식)
+    """
     total_start = time.time()
     step_times = {}
 
     print(f"=== 프로시저 매핑 도구 ===")
-    print(f"입력: {input_file}")
-    print()
 
-    # 1. 프로시저 파일 읽기
+    # 1. 프로시저 본문 가져오기
     step_start = time.time()
-    print("[1/5] 프로시저 파일 읽기...")
-    procedure_text = read_procedure_file(input_file)
-    print(f"  - 읽은 텍스트 길이: {len(procedure_text)} 자")
-    step_times['1_파일읽기'] = time.time() - step_start
 
-    # 프로시저 이름 추출
-    proc_name = extract_procedure_name(procedure_text)
-    if proc_name:
+    if proc_name_arg:
+        # DB에서 프로시저 본문 조회
+        print(f"[1/5] MSSQL에서 프로시저 조회: {proc_name_arg}")
+        procedure_text = get_procedure_from_db(proc_name_arg)
+        if not procedure_text:
+            raise ValueError(f"프로시저 '{proc_name_arg}'을(를) DB에서 찾을 수 없습니다.")
+        proc_name = proc_name_arg
+        original_len = len(procedure_text)
+        procedure_text = remove_sql_comments(procedure_text)
+        print(f"  - 조회된 텍스트 길이: {original_len} 자 → 주석 제거 후: {len(procedure_text)} 자")
         print(f"  - 프로시저 이름: {proc_name}")
     else:
-        print("  - 프로시저 이름: (추출 실패)")
-        proc_name = "Unknown"
+        # 기존 방식: 파일에서 읽기
+        print(f"[1/5] 프로시저 파일 읽기: {input_file}")
+        procedure_text = read_procedure_file(input_file)
+        original_len = len(procedure_text)
+        procedure_text = remove_sql_comments(procedure_text)
+        print(f"  - 읽은 텍스트 길이: {original_len} 자 → 주석 제거 후: {len(procedure_text)} 자")
+
+        # 프로시저 이름 추출
+        proc_name = extract_procedure_name(procedure_text)
+        if proc_name:
+            print(f"  - 프로시저 이름: {proc_name}")
+        else:
+            print("  - 프로시저 이름: (추출 실패)")
+            proc_name = "Unknown"
+
+    step_times['1_입력처리'] = time.time() - step_start
 
     # 출력 경로 설정 (output/excel, output/csv)
     project_root = Path(__file__).parent.parent
@@ -249,10 +282,9 @@ def run(input_file: str, output_file: str):
 
     # 파일명 생성
     excel_file = excel_dir / f"output_{proc_name}.xlsx"
-    csv_input_file = csv_dir / f"{proc_name}_입력.csv"
-    csv_output_file = csv_dir / f"{proc_name}_출력.csv"
+    csv_file = csv_dir / f"{proc_name}.csv"
 
-    print(f"출력 경로: {excel_dir}")
+    print(f"  - 출력 경로: {excel_dir}")
 
     # 2. Gemini API로 분석
     step_start = time.time()
@@ -311,9 +343,15 @@ def run(input_file: str, output_file: str):
     writer.create_sheet("출력", output_tables, output_columns)
     writer.save(str(excel_file))
 
-    # CSV 출력
-    writer.save_csv(str(csv_input_file), input_tables, input_columns, "입력")
-    writer.save_csv(str(csv_output_file), output_tables, output_columns, "출력")
+    # CSV 출력 (통합)
+    writer.save_csv_combined(
+        str(csv_file),
+        proc_name,
+        analysis.description,
+        analysis.parameters,
+        input_tables, input_columns,
+        output_tables, output_columns
+    )
     step_times['5_파일저장'] = time.time() - step_start
 
     # 총 실행 시간 계산
@@ -322,7 +360,7 @@ def run(input_file: str, output_file: str):
     print()
     print("=== 완료 ===")
     print(f"Excel: {excel_file}")
-    print(f"CSV: {csv_input_file.name}, {csv_output_file.name}")
+    print(f"CSV: {csv_file.name}")
     print()
     print("=== 실행 시간 ===")
     for step, elapsed in step_times.items():
@@ -333,7 +371,20 @@ def run(input_file: str, output_file: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='프로시저 테이블/컬럼 매핑 도구'
+        description='프로시저 테이블/컬럼 매핑 도구',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+사용 예시:
+  python -m mapper.main                           # input.txt에서 읽기
+  python -m mapper.main UP_NBOGUN_PlanEduList     # DB에서 프로시저 조회
+  python -m mapper.main -i custom.txt             # 지정 파일에서 읽기
+"""
+    )
+    parser.add_argument(
+        'proc_name',
+        nargs='?',
+        default=None,
+        help='프로시저 이름 (지정 시 MSSQL DB에서 조회)'
     )
     parser.add_argument(
         '--input', '-i',
@@ -349,8 +400,11 @@ def main():
     args = parser.parse_args()
 
     try:
-        run(args.input, args.output)
+        run(args.input, args.output, args.proc_name)
     except FileNotFoundError as e:
+        print(f"오류: {e}")
+        sys.exit(1)
+    except ValueError as e:
         print(f"오류: {e}")
         sys.exit(1)
     except Exception as e:

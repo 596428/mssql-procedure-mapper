@@ -18,6 +18,15 @@ ORACLE_CONFIG = {
     "password": "YOUR_PASSWORD"
 }
 
+# MSSQL 접속정보 (프로시저 본문 조회용)
+MSSQL_CONFIG = {
+    "host": "your-mssql-host.com",
+    "port": 1433,
+    "database": "YOUR_DATABASE",
+    "user": "YOUR_USER",
+    "password": "YOUR_PASSWORD"
+}
+
 # Gemini API 키 (환경변수에서 로드)
 GEMINI_API_KEYS = [
     os.getenv("GEMINI_API_KEY_1", ""),

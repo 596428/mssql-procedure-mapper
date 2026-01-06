@@ -14,9 +14,9 @@ class ExcelWriter:
         self.wb = Workbook()
         # 기본 스타일
         self.header_font = Font(bold=True)
-        self.header_fill = PatternFill(start_color="DAEEF3", end_color="DAEEF3", fill_type="solid")
+        self.header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
         self.section_font = Font(bold=True, size=12)
-        self.section_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        self.section_fill = PatternFill(start_color="868e96", end_color="868e96", fill_type="solid")
         self.section_font_white = Font(bold=True, size=12, color="FFFFFF")
         self.thin_border = Border(
             left=Side(style='thin'),
@@ -253,6 +253,87 @@ class ExcelWriter:
                     info.pk,
                     info.fk,
                     info.old_table_eng,
+                    "O" if info.is_mapped else "X"
+                ])
+
+        print(f"CSV 파일 저장 완료: {filepath}")
+
+    def save_csv_combined(
+        self,
+        filepath: str,
+        proc_name: str,
+        description: str,
+        parameters: list,
+        input_tables: List[TableInfo],
+        input_columns: List[ColumnInfo],
+        output_tables: List[TableInfo],
+        output_columns: List[ColumnInfo]
+    ):
+        """통합 CSV 파일 저장 (프로시저 정보 + 입력 + 출력)"""
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+
+            # [프로시저 정보]
+            writer.writerow(["[프로시저 정보]"])
+            writer.writerow(["프로시저명", proc_name])
+            writer.writerow(["설명", description or ""])
+            writer.writerow([])
+
+            # [파라미터]
+            writer.writerow(["[파라미터]"])
+            writer.writerow(["파라미터명", "데이터타입"])
+            for param in parameters:
+                if isinstance(param, dict):
+                    name = param.get("name", "")
+                    ptype = param.get("type", "")
+                else:
+                    name = str(param)
+                    ptype = ""
+                writer.writerow([name, ptype])
+            writer.writerow([])
+
+            # [입력 테이블 정보]
+            writer.writerow(["[입력 테이블 정보]"])
+            writer.writerow(["관련테이블 한글명", "관련테이블 영문명", "매핑여부"])
+            seen = set()
+            for info in input_tables:
+                key = (info.table_kor, info.table_eng)
+                if key in seen:
+                    continue
+                seen.add(key)
+                writer.writerow([info.table_kor, info.table_eng, "O" if info.is_mapped else "X"])
+            writer.writerow([])
+
+            # [입력 항목 정보]
+            writer.writerow(["[입력 항목 정보]"])
+            writer.writerow(["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK", "기존 테이블 영문명", "매핑여부"])
+            for info in input_columns:
+                writer.writerow([
+                    info.table_kor, info.table_eng, info.col_kor, info.col_eng,
+                    info.data_type, info.length, info.pk, info.fk, info.old_table_eng,
+                    "O" if info.is_mapped else "X"
+                ])
+            writer.writerow([])
+
+            # [출력 테이블 정보]
+            writer.writerow(["[출력 테이블 정보]"])
+            writer.writerow(["관련테이블 한글명", "관련테이블 영문명", "매핑여부"])
+            seen = set()
+            for info in output_tables:
+                key = (info.table_kor, info.table_eng)
+                if key in seen:
+                    continue
+                seen.add(key)
+                writer.writerow([info.table_kor, info.table_eng, "O" if info.is_mapped else "X"])
+            writer.writerow([])
+
+            # [출력 항목 정보]
+            writer.writerow(["[출력 항목 정보]"])
+            writer.writerow(["테이블 한글명", "테이블 영문명", "항목 한글명", "항목 영문명", "유형", "길이", "PK", "FK", "기존 테이블 영문명", "매핑여부"])
+            for info in output_columns:
+                writer.writerow([
+                    info.table_kor, info.table_eng, info.col_kor, info.col_eng,
+                    info.data_type, info.length, info.pk, info.fk, info.old_table_eng,
                     "O" if info.is_mapped else "X"
                 ])
 
